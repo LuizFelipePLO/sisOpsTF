@@ -54,6 +54,7 @@ public class Sistema1B {
                 dump(m[i]);
             }
         }
+
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -84,7 +85,8 @@ public class Sistema1B {
         JMPIGK, JMPILK, JMPIEK, JMPIGT,
         ADDI, SUBI, ADD, SUB, MULT, // matematicos
         LDI, LDD, STD, LDX, STX, MOVE, // movimentacao
-        TRAP // chamada de sistema
+        TRAP, // chamada de sistema
+        SHMALLOC, SHMREF // gerenciamento de memoria compartilhada
     }
 
     public enum Interrupts { // possiveis interrupcoes que esta CPU gera
@@ -116,12 +118,12 @@ public class Sistema1B {
         private InterruptHandling ih; // significa desvio para rotinas de tratamento de Int - se int ligada, desvia
         private SysCallHandling sysCall; // significa desvio para tratamento de chamadas de sistema - trap
 
-        private int particao; // numero da particao em que está o programa rodando
-        private int tamParticao;
+        private int tamPagina;
+        private int[] paginasProcesso; // vetor de frames
+        private int[] tabelaDePaginas;
         public boolean debug;
-        private int[] paginasAlocadas;
 
-        public CPU(Memory _mem, int _tamParticao, InterruptHandling _ih, SysCallHandling _sysCall) { // ref a MEMORIA e
+        public CPU(Memory _mem, int tamPagina, InterruptHandling _ih, SysCallHandling _sysCall) { // ref a MEMORIA e
             // interrupt handler
             // passada na
             // criacao da CPU
@@ -132,7 +134,7 @@ public class Sistema1B {
             reg = new int[10]; // aloca o espaço dos registradores - regs 8 e 9 usados somente para IO
             ih = _ih; // aponta para rotinas de tratamento de int
             sysCall = _sysCall; // aponta para rotinas de tratamento de chamadas de sistema
-            tamParticao = _tamParticao;
+            this.tamPagina = tamPagina;
         }
 
         private boolean legal(int e) { // todo acesso a memoria tem que ser verificado
@@ -146,6 +148,8 @@ public class Sistema1B {
 
         private boolean enderecoValido(int end) { // se acessar endereço fora do limite
             if ((end < base) || (end > limite)) {
+                System.out.println("Endereco invalido: " + end);
+
                 irpt = Interrupts.intEnderecoInvalido;
                 return false;
             }
@@ -171,24 +175,30 @@ public class Sistema1B {
             return true;
         }
 
-        public void setContext(int _pc, int[] paginasAlocadas) {
+        public void setContext(int _base, int _limite, int _pc, int[] paginasProcesso) { // no futuro esta funcao vai
+                                                                                         // ter que ser
+            base = _base; // expandida para setar todo contexto de execucao,
+            limite = _limite; // agora, setamos somente os registradores base,
             pc = _pc; // limite e pc (deve ser zero nesta versao)
             irpt = Interrupts.noInterrupt; // reset da interrupcao registrada
-            this.paginasAlocadas = paginasAlocadas;
+            this.paginasProcesso = paginasProcesso;
+            this.tabelaDePaginas = tabelaDePaginas;
         }
 
         public int traduzEnderecoProcesso(int endereco) {
-            if (enderecoValido(endereco)) {
-                endereco = (particao * tamParticao) - 1 + endereco;
-                return endereco;
-            }
-            System.out.println("Erro ao traduzir endereço do processo");
-            System.out.println("Endereço: " + endereco);
-            System.out.println("Partição: " + particao);
-            System.out.println("Tamanho da Partição: " + tamParticao);
+            try {
+                int frame = paginasProcesso[endereco / tamPagina];
+                int posFisicaDaPagina = frame * tamPagina;
+                int offset = endereco % tamPagina;
+                endereco = posFisicaDaPagina + offset;
 
-            irpt = Interrupts.intEnderecoInvalido;
-            return -1;
+                return endereco;
+            } catch (Exception e) {
+                System.out.println("Erro ao traduzir endereço do processo");
+                System.out.println("Endereço: " + endereco);
+                irpt = Interrupts.intEnderecoInvalido;
+                return -1;
+            }
         }
 
         public void run() { // execucao da CPU supoe que o contexto da CPU, vide acima, esta devidamente
@@ -200,7 +210,9 @@ public class Sistema1B {
                 // traduz para endereço dos processos
 
                 if (legal(pc)) { // pc valido
-                    ir = m[pc]; // <<<<<<<<<<<< busca posicao da memoria apontada por pc, guarda em ir
+                    ir = m[traduzEnderecoProcesso(pc)]; // <<<<<<<<<<<< busca posicao da memoria apontada por pc, guarda
+                                                        // em ir
+
                     if (debug) {
                         System.out.print("                               pc: " + pc + "       exec: ");
                         mem.dump(ir);
@@ -323,7 +335,7 @@ public class Sistema1B {
                         // Instrucoes JUMP
                         case JMP: // PC <- k desvio incondicional
                             if (enderecoValido(traduzEnderecoProcesso(ir.p))) {
-                                pc = traduzEnderecoProcesso(ir.p);
+                                pc = ir.p;
                                 break;
                             } else
                                 break;
@@ -478,7 +490,14 @@ public class Sistema1B {
                             // temos IO
                             pc++;
                             break;
-
+                        case SHMALLOC:
+                            // aloca mais uma pagina para o processo rodando
+                            sysCall.handle();
+                            break;
+                        case SHMREF:
+                            // referencia a pagina de memoria compartilhada
+                            sysCall.handle();
+                            break;
                         // Inexistente
                         default:
                             irpt = Interrupts.intInstrucaoInvalida;
@@ -504,32 +523,32 @@ public class Sistema1B {
     // -----------------------------------------------
     public class VM {
         public int tamMem;
-        public int tamParticao;
+        public int tamPag;
         public Word[] m;
         public Memory mem;
         public CPU cpu;
         public boolean debug;
 
-        public VM(InterruptHandling ih, SysCallHandling sysCall, int tamMem, int tamParticao, boolean debug) {
+        public VM(InterruptHandling ih, SysCallHandling sysCall, int tamMem, int tamPag, boolean debug) {
             // vm deve ser configurada com endereço de tratamento de interrupcoes e de
             // chamadas de sistema
             // cria memória
             this.tamMem = tamMem;
-            this.tamParticao = tamParticao;
+            this.tamPag = tamPag;
             this.debug = debug;
             mem = new Memory(tamMem);
             m = mem.m;
 
             // cria cpu
-            cpu = new CPU(mem, tamParticao, ih, sysCall); // true liga debug
+            cpu = new CPU(mem, tamPag, ih, sysCall); // true liga debug
         }
 
         public int getTamMem() {
             return tamMem;
         }
 
-        public int getTamParticao() {
-            return tamParticao;
+        public int getTamPagina() {
+            return tamPag;
         }
 
         public void setDebug(boolean debug) {
@@ -581,11 +600,16 @@ public class Sistema1B {
                     System.out.println("Motivo: Chamada de sistema");
                     terminal();
                     break;
+                case intSTOP:
+                    System.out.println("Final do Programa");
+                    // finalizaProcesso();
+                    break;
             }
         }
 
         private void terminal() {
             Locale.setDefault(Locale.US);
+
             Scanner sc = new Scanner(System.in);
 
             if (vm.cpu.reg[8] == 1) {// leitura de um inteiro
@@ -604,11 +628,30 @@ public class Sistema1B {
                         .println("                                               Imprimindo da função Trap: resposta: "
                                 + var + " e pos de memória: " + pos);
             }
+            if (vm.cpu.reg[8] == 3) {
+                // sisop pede para gm mais um frame
+                // inclui na próxima posiçao do vetor de frames do programa e devolve
+                // e o processo continua até o novo frame alocador
+                // o gm deverá colocar essa pagina como ocupada e associar a chave 777
+                int chave = vm.cpu.reg[9];
+
+            }
+            if (vm.cpu.reg[8] == 4) {
+                // outro processo com a chave pede para acessar a memoria compartilhada
+                // gm cuida disso, na tabela de paginas deve verificar se está ocupado e se tem
+                // chave associada
+
+            }
 
         }
 
         private void finalizaPrograma() {
             System.out.println("Fim do programa por interrupção.");
+            System.exit(0);
+        }
+
+        private void finalizaProcesso() {
+            System.out.println("Fim do programa");
             System.exit(0);
         }
 
@@ -678,14 +721,14 @@ public class Sistema1B {
 
     // case 2
     private void listaProcessosPCB() {
-        gp.listaProcessosPCB();
+        gp.listaProcessos();
     }
 
     // case 3
     private void desaloca(int id) {
         try {
-
-            gp.desalocaProcesso(id);
+            PCB pcbProcesso = prontos.get(id);
+            gp.desalocaProcesso(pcbProcesso);
         } catch (Exception e) {
             System.out.println("------- Processo não encontrado");
         }
@@ -704,11 +747,36 @@ public class Sistema1B {
     }
 
     // case 5
-    public void executa(int id2) {
-        vm.cpu.setContext(0, gm.getFramesAlocados()); // monitor seta contexto - pc aponta para inicio do programa
-        vm.cpu.run(); // e cpu executa
-        // note aqui que o monitor espera que o programa carregado acabe normalmente
-        // nao ha protecoes... o que poderia acontecer ?
+    private void executa(int idProcesso) {
+        // executa o processo
+
+        try {
+
+            PCB pcbProcesso = gp.getPCB(idProcesso);
+            int pcProcesso = pcbProcesso.getPc();
+            int[] paginasProcesso = pcbProcesso.getFrames();
+            int ultimoFrame = paginasProcesso[paginasProcesso.length - 1];
+            int offset = gm.tamFrame % pcbProcesso.getTamanhoProcesso();
+            int posLimite = ultimoFrame * gm.tamFrame + offset;
+            int posInicio = gm.traduzEnderecoFisico(pcbProcesso, 0);
+
+            System.out.println("-      Executando processo: " + idProcesso + " nos frames : "
+                    + Arrays.toString(paginasProcesso) + " com pc em: " + pcProcesso + " e tamanho de programa: "
+                    + pcbProcesso.getTamanhoProcesso());
+
+            gm.dumpPagina(pcbProcesso);
+
+            System.out.println("---------------------------------- inicia execucao ");
+
+            vm.cpu.setContext(posInicio, posLimite, pcProcesso, paginasProcesso); // seta estado da cpu ]
+            vm.cpu.run();
+
+            System.out.println("---------------------------------- memoria após execucao ");
+            gm.dumpPagina(pcbProcesso); // dump da memoria com resultado
+        } catch (IndexOutOfBoundsException e) {
+            System.out.println("----- Processo não encontrado");
+
+        }
     }
 
     // case 6 e 7
@@ -718,8 +786,17 @@ public class Sistema1B {
     }
 
     // case 8
-    public void listaProcessosProntos() {
-        gp.listaProcessos();
+    public void listaProcessosPorID(int id) {
+
+        try {
+            PCB pcbProcesso = gp.getPCB(id);
+            System.out.println("------- Processo encontrado: ");
+            System.out.println("\nPCB: " + pcbProcesso.toString());
+            gm.dumpPagina(pcbProcesso);
+
+        } catch (Exception e) {
+            System.out.println("------- Processo não encontrado");
+        }
     }
 
     // ------------------- GM GP PCB - inicio
@@ -727,111 +804,102 @@ public class Sistema1B {
     public class GM {
 
         private Word[] m;
-        private Memory mem;
-        private int tamFrame;
+        private int tamMem;
         private int tamPagina;
-        private int nroFrames;
-        private boolean[] tabelaPaginas;
-        private int[] framesAlocados;
-        private LinkedList<PCB> prontos;
+        private int tamFrame;
+        private int numFrames;
+        public boolean[] tabelaPaginas;
+        private int[] framesParaPrograma;
 
-        public boolean[] particoesLivres;
+        // public boolean[] particoesLivres;
 
-        public void GerenciadorMemoria(Word[] m, int tamPagina) {
+        public GM(Word[] m, int tamMem, int tamPagina) {
             this.m = m;
+            this.tamMem = tamMem;
             this.tamPagina = tamPagina;
+            numFrames = tamMem / tamPagina;
             tamFrame = tamPagina;
-            nroFrames = m.length / tamPagina;
-            tabelaPaginas = initFrames();
-            // quantidadeDePaginasUsadas = 0;
+            this.tabelaPaginas = new boolean[numFrames];
+            for (int i = 0; i < numFrames; i++) {
+                tabelaPaginas[i] = true;
+            }
+
+            // simulando partição ocupada
+            tabelaPaginas[0] = false;
+            tabelaPaginas[2] = false;
+            tabelaPaginas[4] = false;
         }
 
-        private boolean[] initFrames() {
-            boolean[] livre = new boolean[nroFrames];
-            for (int i = 0; i < nroFrames; i++) {
-                livre[i] = true;
+        private int[] alocaPagina(Word[] programa) {
+            int tamanhoPrograma = programa.length; // pega o tamanho do programa
+            int numPaginasPrograma = tamanhoPrograma / tamPagina; // calcula o numero de paginas necessárias
+            if (tamanhoPrograma % tamPagina != 0) { // alocar mais uma pagina, se o tamanho do programa dividido pelo
+                                                    // tamanho de pagina não resultar em divisão inteira
+                numPaginasPrograma++;
             }
+            framesParaPrograma = new int[numPaginasPrograma]; // cria um vetor de frames com o tamanho do numero de
+                                                              // paginas necessárias
 
-            livre[5] = false;
-
-            return livre;
-        }
-
-        public int[] aloca(Word[] programa) {
-            int qtdPaginas = programa.length / tamPagina;
-            if (programa.length % tamPagina > 0)
-                qtdPaginas++; // vê se ainda tem código além da divisão inteira
-            framesAlocados = new int[qtdPaginas];
-            int indiceAlocado = 0;
-            int indicePrograma = 0; // indice do programa
-
-            // testa se tem espaço para alocar o programa
-            int framesLivres = 0;
-            for (int i = 0; i < nroFrames; i++) {
-                if (tabelaPaginas[i]) // vê se o frame está vazio e conta 1
-                    framesLivres++;
-            }
-
-            // se não existe memória suficiente retorna um array com -1
-            if (framesLivres <= qtdPaginas) {
-                framesAlocados[0] = -1;
-                return framesAlocados;
-            }
-
-            for (int i = 0; i < nroFrames; i++) {
-                if (qtdPaginas == 0)
-                    break;
-                if (tabelaPaginas[i]) { // vê se o frame está vazio e aloca o programa ali
-                    tabelaPaginas[i] = false; // marca o frame como ocupado
-
-                    for (int j = tamPagina * i; j < tamPagina * (i + 1); j++) {
-                        if (indicePrograma >= programa.length)
-                            break;
-                        m[j].opc = programa[indicePrograma].opc;
-                        m[j].r1 = programa[indicePrograma].r1;
-                        m[j].r2 = programa[indicePrograma].r2;
-                        m[j].p = programa[indicePrograma].p;
-                        indicePrograma++;
-                    }
-                    framesAlocados[indiceAlocado] = i;
-                    indiceAlocado++;
-                    qtdPaginas--;
+            // percorre o tabela de página para achar espaço livre que seja possível alocar
+            // o programa cnfme numPaginasPrograma
+            int frames = 0;
+            for (int i = 0; i < numFrames; i++) {
+                if (tabelaPaginas[i] == true) {
+                    frames++;
                 }
-
             }
-            return framesAlocados;
+            // int posPrograma = 0;
+            int posVetorFrames = 0;
+            if (frames < numPaginasPrograma) { // se não houver espaço livre para alocar o programa, ou seja o numero de
+                                               // frames livres é menor que o numero de paginas necessárias
+                System.out.println("----- Não há espaço para alocar o programa");
+                framesParaPrograma[0] = -1;
+                return framesParaPrograma;
+            } else {
+
+                for (int i = 0; i < numFrames; i++) {
+                    if (numPaginasPrograma > 0) {// se a posição estiver livre, aloca
+                        if (tabelaPaginas[i] == true) {
+                            tabelaPaginas[i] = false; // marca como ocupado a posição na tabela de páginas
+
+                            framesParaPrograma[posVetorFrames] = i;
+                            posVetorFrames++;
+                            numPaginasPrograma--;
+
+                        }
+                    }
+                }
+                System.out.println(
+                        "-     Gerente de memória: Alocar programa nos frames: " + Arrays.toString(framesParaPrograma));
+
+                return framesParaPrograma;
+            }
+
         }
 
-        public void desaloca(PCB processo) {
-            int[] paginas = processo.getPaginasAlocadas();
-            for (int i = 0; i < paginas.length; i++) {
-                tabelaPaginas[paginas[i]] = true; // libera o frame
+        private void desalocaPagina(PCB pcbProcesso) {
+            int[] paginas = pcbProcesso.getFrames();
+            System.out.println("-     Gerente de memória: Desalocar programa nos frames: " + Arrays.toString(paginas));
 
-                // reseta as posicoes da memória
-                for (int j = tamPagina * paginas[i]; j < tamPagina * (paginas[i] + 1); j++) {
+            for (int i = 0; i < paginas.length; i++) {
+                tabelaPaginas[paginas[i]] = true; // desaloca da tabela de páginas do processo -- tabela de paginas na
+                                                  // pos do frame, recebe true
+                System.out.println("\n-     Gerente de memória: Página desalocada: " + paginas[i]);
+
+                // libera a memória
+                for (int j = paginas[i] * tamFrame; j < (paginas[i] + 1) * tamFrame; j++) { // frame inicia em
+                                                                                            // (f)*tamFrame --- ex: 1 *
+                                                                                            // 8 = 8
+                                                                                            // frame termina em
+                                                                                            // (f+1)*tamFrame -1 ---
+                                                                                            // ex:(1+1)*8-1= 15
                     m[j].opc = Opcode.___;
                     m[j].r1 = -1;
                     m[j].r2 = -1;
                     m[j].p = -1;
+
                 }
             }
-        }
-
-        public int getQuantidadePaginasUsadas() {
-            int qtd = 0;
-            for (int i = 0; i < tabelaPaginas.length; i++) {
-                if (tabelaPaginas[i] == false)
-                    qtd++;
-            }
-            return qtd;
-        }
-
-        public int[] getFramesAlocados() {
-            return framesAlocados;
-        }
-
-        public boolean[] getTabelaPaginas() {
-            return tabelaPaginas;
         }
 
         public void dump(Word w) {
@@ -846,89 +914,124 @@ public class Sistema1B {
             System.out.println("  ] ");
         }
 
-        public int traduzEndereco(int[] is) {
-            try {
-                return (paginasAlocadas[(is / tamPaginaMemoria)] * tamPaginaMemoria) + (is % tamPaginaMemoria);
+        public void imprimeMemoria(Word[] m, int inicio, int fim) {
+            for (int i = inicio; i <= fim; i++) {
+                System.out.print("Posição da Memória " + i);
+                System.out.print(":  ");
+                dump(m[i]);
 
-            } catch (ArrayIndexOutOfBoundsException e) {
-                System.out.println("Retorno -1 do traduz");
+            }
+        }
+
+        private int traduzEnderecoFisico(PCB programa, int enderecoLogicoPrograma) {// função que traduz para o enederço
+                                                                                    // físico da memória
+            if (enderecoLogicoPrograma < 0 || enderecoLogicoPrograma > tamMem) {
+                System.out.println("----- Endereço inválido");
                 return -1;
             }
+            int[] framesDoPrograma = programa.getFrames();
+            int paginaDoPrograma = enderecoLogicoPrograma / tamPagina; // a pagina é a divisão inteira do endereço
+                                                                       // lógico pelo tamanho da página
+
+            int offsetDoPrograma = enderecoLogicoPrograma % tamPagina; // offset é a posição exata dentro da página
+            int frameDoEndereco = framesDoPrograma[paginaDoPrograma]; // utiliza a pagina do programa para pegar o frame
+                                                                      // exato no vetor de frames do programa
+            int enderecoFisico = frameDoEndereco * tamFrame + offsetDoPrograma; // (f)*tamFrame
+            return enderecoFisico;
+        }
+
+        public void dumpPagina(PCB programa) {
+
+            for (int i = 0; i <= programa.tamanhoProcesso; i++) {
+                int enderecoFisico = traduzEnderecoFisico(programa, i);
+                dump(m[enderecoFisico]);
+            }
+
         }
 
     }
 
     public class GP {
         private GM gm;
-        private Word[] m;
+        private Word[] mem;
         private int idProcesso;
         private LinkedList<PCB> prontos;
-        private int idProcessoRodando;
 
         public GP() {
             this.idProcesso = 0;
-            this.idProcessoRodando = 0;
+
         }
 
-        public void carregaGP(GM gm, Word[] m, LinkedList<PCB> prontos) {
+        public PCB getPCB(int id) {
+            return prontos.get(id);
+        }
+
+        public void carregaGP(GM gm, Word[] mem, LinkedList<PCB> prontos) {
             this.gm = gm;
-            this.m = m;
+            this.mem = mem;
             this.prontos = prontos;
         }
 
-        public boolean criaProcesso(Word[] programa) {
-            System.out.println("Processo " + idProcessoRodando + " criado");
-            int[] paginasAlocadas = gm.aloca(programa);
-
-            // Se o processo não foi criado por falta de memória, retorna falso
+        private boolean criaProcesso(Word[] programa) {
+            int[] paginasAlocadas = gm.alocaPagina(programa);
+            // System.out.println(paginasAlocadas.length);
             if (paginasAlocadas[0] == -1) {
+                System.out.println("----- Não foi possível criar processo em memória");
                 return false;
             }
-
-            PCB processo = PCB(idProcessoRodando, paginasAlocadas);
-            idProcessoRodando++;
-            prontos.add(processo);
-
-            // debug
-            System.out.println("Páginas alocadas");
+            // carga do processo na partição retornada por GM
+            PCB processo = new PCB(idProcesso, 0, programa.length, paginasAlocadas);
+            // int pcProcesso = gm.traduzEnderecoFisico(processo, 0); // traduz o endereço
+            // lógico do pc do programa para o endereço físico
+            // int pcProcesso = paginasAlocadas[0] * gm.tamFrame; // traduz o endereço
+            // lógico do pc do programa para o endereço físico
+            // processo.setPc(pcProcesso);
+            int indicePrograma = 0;
             for (int i = 0; i < paginasAlocadas.length; i++) {
-                System.out.println(paginasAlocadas[i] + " ");
+                // System.out.println("i: " + i);
+                // System.out.println("Pagina alocada: " + paginasAlocadas[i]);
+                int indice = paginasAlocadas[i] * gm.tamFrame;
+                for (int j = indice; j < indice + gm.tamFrame; j++) {
+                    if (indicePrograma >= programa.length) {
+                        break;
+                    }
+                    mem[j].opc = programa[indicePrograma].opc;
+                    mem[j].r1 = programa[indicePrograma].r1;
+                    mem[j].r2 = programa[indicePrograma].r2;
+                    mem[j].p = programa[indicePrograma].p;
+                    indicePrograma++;
+                }
             }
+
+            prontos.add(processo);
+            System.out.println("\n-     Gerente de processos: Processo criado com id: " + idProcesso + " com tamanho: "
+                    + programa.length + " distribuído nos Frames: " + Arrays.toString(paginasAlocadas));
+            idProcesso++;
 
             return true;
+
         }
 
-        public void finalizaProcesso(PCB processo) {
-            gm.desaloca(processo);
+        private void desalocaProcesso(PCB processo) {
+
+            gm.desalocaPagina(processo);
+            System.out.println("\n*** Processo de id " + processo.getIdPCB() + " desalocado com sucesso. ***\n");
+
             prontos.remove(processo);
-        }
-
-        private void desalocaProcesso(int idProcesso) {
-            PCB pcbProcesso = prontos.get(idProcesso);
-
-            int inicioDesaloca = gm.traduzEndereco(pcbProcesso.getPaginasAlocadas());
-            int fimDesaloca = inicioDesaloca + pcbProcesso.getIdProcesso() - 1;
-            // remoção do processo na partição
-            for (int i = inicioDesaloca; i <= fimDesaloca; i++) {
-                m[i].opc = Opcode.___;
-                m[i].r1 = -1;
-                m[i].r2 = -1;
-                m[i].p = -1;
-            }
-
-            gm.desaloca(pcbProcesso);
-            System.out.println("*** Processo de id " + idProcesso + " desalocado com sucesso. ***\n");
-
-            prontos.get(idProcesso).PCB(-1, -1, gm.framesAlocados);
-            // prontos.remove(idProcesso);
         }
 
         public void imprimeProcessoPorID(int id) {
             PCB pcbProcesso = prontos.get(id);
-            int inicio = gm.traduzEnderecoProcesso(endereco);
-            int fim = inicio + pcbProcesso.getIdProcesso();
-            for (int i = inicio; i <= fim; i++) {
-                gm.dump(m[i]);
+            int[] paginasAlocadas = pcbProcesso.getFrames();
+
+            int endereco = 0;
+            for (int j = 0; j < paginasAlocadas.length; j++) {
+                int inicio = gm.traduzEnderecoFisico(pcbProcesso, endereco);
+                for (int i = inicio; i <= gm.tamFrame; i++) {
+                    gm.dump(mem[i]);
+                }
+                endereco++;
+
             }
         }
 
@@ -939,10 +1042,9 @@ public class Sistema1B {
             } else {
                 for (int i = 0; i < prontos.size(); i++) {
                     PCB pcbProcesso = prontos.get(i);
-                    if (pcbProcesso.getParticao() != -1) {
-                        System.out.println("-      Processo: " + pcbProcesso.getIdProcesso() + " na partição: "
-                                + (prontos.get(i).getParticao()) + " posição física: "
-                                + gm.traduzEnderecoFisico(prontos.get(i).getParticao()));
+                    if (pcbProcesso.getPc() != -1) {
+                        System.out.println("-      Processo: " + pcbProcesso.getIdPCB() + " na Frames ocupados: "
+                                + Arrays.toString(pcbProcesso.getFrames()));
 
                     }
 
@@ -950,43 +1052,51 @@ public class Sistema1B {
             }
 
         }
-
-        public void listaProcessosPCB() {
-            System.out.println("\n*****       Lista de PCB de cada processos: *****");
-            if (prontos.isEmpty()) {
-                System.out.println("    Nenhum processo criado até o momento.\n");
-            } else {
-                for (int i = 0; i < prontos.size(); i++) {
-                    PCB pcbProcesso = prontos.get(i);
-                    if (pcbProcesso.getParticao() != -1) {
-                        System.out.println("-       Processo: " + pcbProcesso.getIdProcesso() + " na partição: "
-                                + (prontos.get(i).getParticao()) + " tamanho do processo: "
-                                + pcbProcesso.getIdProcesso() + " posição física: "
-                                + gm.traduzEnderecoFisico(prontos.get(i).getParticao()));
-                    }
-                }
-            }
-        }
-
     }
 
     public class PCB {
-        private int idProcesso;
-        private int[] paginasAlocadas;
+        private int idPCB;
+        private int pc;
+        private int tamanhoProcesso;
+        private int[] frames;
 
-        public void PCB(int idProcesso, int[] paginasAlocadas) {
-            this.idProcesso = idProcesso;
-            this.paginasAlocadas = paginasAlocadas;
+        public PCB(int idPCB, int[] frames) {
+            this.idPCB = idPCB;
+            this.frames = frames;
         }
 
-        public int[] getPaginasAlocadas() {
-            return this.paginasAlocadas;
+        public PCB(int idPCB, int pc, int tamanhoProcesso, int[] frames) {
+            this.idPCB = idPCB;
+            this.pc = pc;
+            this.tamanhoProcesso = tamanhoProcesso;
+            this.frames = frames;
         }
 
-        public int getIdProcesso() {
-            return this.idProcesso;
+        public int[] getFrames() {
+            return frames;
         }
 
+        public int getIdPCB() {
+            return idPCB;
+        }
+
+        public int getPc() {
+            return pc;
+        }
+
+        public int setPc(int pc) {
+            return this.pc = pc;
+        }
+
+        public int getTamanhoProcesso() {
+            return tamanhoProcesso;
+        }
+
+        @Override
+        public String toString() {
+            return "PCB [id do Programa =" + idPCB + ", pc=" + pc + ", tamanhoProcesso=" + tamanhoProcesso
+                    + " Alocação em memória: " + Arrays.toString(frames) + "]";
+        }
     }
 
     // ------------------ GM GP PCB - fim
@@ -1003,15 +1113,6 @@ public class Sistema1B {
     public GP gp;
     private LinkedList<PCB> prontos;
     public boolean debug;
-    private int idProcesso;
-    private int pc;
-    private int tamanhoProcesso;
-
-    public void PCB(int idProcesso, int pc, int tamanhoProcesso) {
-        this.idProcesso = idProcesso;
-        this.pc = pc;
-        this.tamanhoProcesso = tamanhoProcesso;
-    }
 
     public Sistema1B(int tamMem, int tamPagina) { // a VM com tratamento de interrupções
         ih = new InterruptHandling();
@@ -1019,7 +1120,7 @@ public class Sistema1B {
         vm = new VM(ih, sysCall, tamMem, tamPagina, debug);
         sysCall.setVM(vm);
         progs = new Programas();
-        gm = new GM();
+        gm = new GM(vm.m, vm.tamMem, tamPagina);
         gp = new GP();
         prontos = new LinkedList();
 
@@ -1037,27 +1138,28 @@ public class Sistema1B {
     public static void main(String args[]) {
 
         int tamMemoria = 1024;
-        int tamParticao = 64;
+        int tamPagina = 8;
 
         // --------- Menu
         // ----------------------------------------------------------------
         Scanner sc = new Scanner(System.in);
 
-        Sistema1B s = new Sistema1B(tamMemoria, tamParticao);
+        Sistema1B s = new Sistema1B(tamMemoria, tamPagina);
 
         while (true) {
             System.out
                     .println(" \n____________________________________________________________________________________");
             System.out.println("    Escolha uma opção:");
-            System.out.println("    1 - Cria programa - cria um processo com memória alocada, PCB, etc."); // ok
-            System.out.println("    2 - Dump - lista o conteúdo do PCB."); // ok
-            System.out.println("    3 - Desaloca - retira o processo id do sistema."); // ok
-            System.out.println("    4 - DumpM - lista a memória entre posições início e fim."); // ok
+            System.out.println("    1 - Cria programa - cria um processo com memória alocada, PCB, etc.");
+            System.out.println("    2 - ListaProcessos - lista os processos prontos para rodar.");
+            System.out.println("    3 - Desaloca - retira o processo id do sistema.");
+            System.out.println("    4 - DumpM - lista a memória entre posições início e fim.");
             System.out.println("    5 - Executa - executa o processo com id fornecido.");
             System.out.println("    6 - TraceOn - liga modo de execução em que CPU print cada instrução executada.");
             System.out.println("    7 - TraceOff - desliga o modo acima TraceOn.");
-            System.out.println("    8 - ListaProcessos - lista os processos prontos para rodar.");// ok
-            System.out.println("    0 - Sair - encerra o programa.");// ok
+            System.out.println(
+                    "    8 - DumpID - lista o conteúdo do PCB e o conteúdo das páginas de memória do processo com id.");
+            System.out.println("    0 - Sair - encerra o programa.");
             System.out
                     .println(" ____________________________________________________________________________________\n");
 
@@ -1094,7 +1196,7 @@ public class Sistema1B {
                             s.loadAndExecGM_GP(progs.fatorial);
                             break;
                         case 4:
-                            s.loadAndExecGM_GP(progs.fatorialTRAP);
+                            s.loadAndExecGM_GP(progs.fatorialTRAP2);
                             break;
                         case 5:
                             s.loadAndExecGM_GP(progs.fibonacciTRAP);
@@ -1152,7 +1254,10 @@ public class Sistema1B {
                     break;
 
                 case 8:
-                    s.listaProcessosProntos();
+                    System.out.println("Digite o id do processo a ser consultado:");
+                    int id3;
+                    id3 = sc.nextInt();
+                    s.listaProcessosPorID(id3);
                     break;
                 case 0:
                     System.exit(0);
@@ -1206,7 +1311,8 @@ public class Sistema1B {
                 new Word(Opcode.SUB, 0, 6, -1), // 6 decrementa r0 1
                 new Word(Opcode.JMP, -1, -1, 4), // 7 vai p posicao 4
                 new Word(Opcode.STD, 1, -1, 10), // 8 coloca valor de r1 na posição 10
-                new Word(Opcode.STOP, -1, -1, -1), // 9 stop
+                new Word(Opcode.STOP, -1, -1, -1),
+                new Word(Opcode.DATA, -1, -1, -1), // 9 stop
                 new Word(Opcode.DATA, -1, -1, -1) }; // 10 ao final o valor do fatorial estará na posição 10 da memória
 
         public Word[] progMinimo = new Word[] {
@@ -1249,6 +1355,28 @@ public class Sistema1B {
                 new Word(Opcode.DATA, -1, -1, -1),
                 new Word(Opcode.DATA, -1, -1, -1),
                 new Word(Opcode.DATA, -1, -1, -1) }; // ate aqui - serie de fibonacci ficara armazenada
+
+        public Word[] fatorialTRAP2 = new Word[] {
+                new Word(Opcode.LDI, 0, -1, 7), // numero para colocar na memoria
+                new Word(Opcode.STD, 0, -1, 19),
+                new Word(Opcode.LDD, 0, -1, 19),
+                new Word(Opcode.LDI, 1, -1, -1),
+                new Word(Opcode.LDI, 2, -1, 13), // SALVAR POS STOP
+                new Word(Opcode.JMPIL, 2, 0, -1), // caso negativo pula pro STD
+                new Word(Opcode.LDI, 1, -1, 1),
+                new Word(Opcode.LDI, 6, -1, 1),
+                new Word(Opcode.LDI, 7, -1, 13),
+                new Word(Opcode.JMPIE, 7, 0, 0), // POS 9 pula pra STD (Stop-1)
+                new Word(Opcode.MULT, 1, 0, -1),
+                new Word(Opcode.SUB, 0, 6, -1),
+                new Word(Opcode.JMP, -1, -1, 9), // pula para o JMPIE
+                new Word(Opcode.STD, 1, -1, 18),
+                new Word(Opcode.LDI, 8, -1, 2), // escrita
+                new Word(Opcode.LDI, 9, -1, 18), // endereco com valor a escrever
+                new Word(Opcode.TRAP, -1, -1, -1),
+                new Word(Opcode.STOP, -1, -1, -1), // POS 17
+                new Word(Opcode.DATA, -1, -1, -1), // POS 18
+                new Word(Opcode.DATA, -1, -1, -1) };// POS 19
 
         public Word[] fatorialTRAP = new Word[] {
                 new Word(Opcode.LDI, 0, -1, 7), // numero para colocar na memoria
